@@ -13,5 +13,3 @@ int main(int argc, char** argv)
     printf("Odrive simulation ended\r\n");
     return 0;
 }
-
-3
