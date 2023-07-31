@@ -8,6 +8,7 @@
 #include <thread>
 #include <atomic>
 #include <array>
+#include <chrono>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,16 +20,6 @@
 #include <linux/can/raw.h>
 #include <algorithm>
 #include <iostream>
-
-class Joint
-{
-    static const int J0 = 0;
-    static const int J1 = 1;
-    static const int J2 = 2;
-    static const int J3 = 3;
-    static const int J4 = 4;
-    static const int J5 = 5;
-};
 
 class OdriveCanSim
 {
@@ -52,6 +43,31 @@ public:
         encoder_positions_ = {0.0,0.0,0.0,0.0,0.0,0.0};
         encoder_velocities_ = {0.0,0.0,0.0,0.0,0.0,0.0};
         prev_encoder_pos_ = encoder_positions_;
+
+        // Threads
+        encoder_broadcast_ms_ = std::chrono::milliseconds(10);
+    }
+    
+    /**
+     * @brief Construct a new Odrive Can Sim object
+     * 
+     * @param can_name 
+     * @param joint_can_ids 
+     * @param encoder_broadcast_ms 
+     */
+    OdriveCanSim(const std::string& can_name, const std::array<int, 6> joint_can_ids, int encoder_broadcast_ms = 10)
+    {
+        // Initialize
+        can_name_ = can_name;
+        joint_can_ids_ = joint_can_ids;
+
+        // Zero
+        encoder_positions_ = {0.0,0.0,0.0,0.0,0.0,0.0};
+        encoder_velocities_ = {0.0,0.0,0.0,0.0,0.0,0.0};
+        prev_encoder_pos_ = encoder_positions_;
+
+        // Threads
+        encoder_broadcast_ms_ = std::chrono::milliseconds(encoder_broadcast_ms);
     }
 
     /**
@@ -146,10 +162,6 @@ public:
         can_read_thread_ = std::thread{&OdriveCanSim::can_read_task, this};
         can_write_thread_ = std::thread{&OdriveCanSim::can_write_task, this};
           
-        // Starting velocity updater
-        is_velocity_updating_.store(true);
-        //velocity_updater_thread_ = std::thread{&OdriveCanSim::velocity_updater_task, this};
-
         printf("Odrive CAN connected\r\n");  
         is_main_running_ = true;
         return true;
@@ -165,7 +177,6 @@ public:
         // Disable CAN reading and stop the threads
         is_can_reading_.store(false);
         is_can_writing_.store(false);
-        is_velocity_updating_.store(false);
 
         // Stop spinning
         is_main_running_ = false;
@@ -183,18 +194,8 @@ public:
      */
     std::array<float, 6> get_position()
     {
-        float enc0, enc1, enc2, enc3, enc4, enc5;
-
-        mtx_pos_.lock();
-        enc0 = encoder_positions_[0];
-        enc1 = encoder_positions_[1];
-        enc2 = encoder_positions_[2];
-        enc3 = encoder_positions_[3];
-        enc4 = encoder_positions_[4];
-        enc5 = encoder_positions_[5];
-        mtx_pos_.unlock();
-
-        return std::array<float, 6>{enc0, enc1, enc2, enc3, enc4, enc5};
+        const std::lock_guard<std::mutex> lock(mtx_pos_);
+        return encoder_positions_;
     }
 
     /**
@@ -204,18 +205,8 @@ public:
      */
     std::array<float, 6> get_velocity()
     {
-        float enc0, enc1, enc2, enc3, enc4, enc5;
-
-        mtx_vel_.lock();
-        enc0 = encoder_velocities_[0];
-        enc1 = encoder_velocities_[1];
-        enc2 = encoder_velocities_[2];
-        enc3 = encoder_velocities_[3];
-        enc4 = encoder_velocities_[4];
-        enc5 = encoder_velocities_[5];
-        mtx_vel_.unlock();
-
-        return std::array<float, 6>{enc0, enc1, enc2, enc3, enc4, enc5};
+        const std::lock_guard<std::mutex> lock(mtx_vel_);
+        return encoder_velocities_;
     }
 
     /**
@@ -226,15 +217,8 @@ public:
      */
     bool set_position(std::array<float, 6> encs)
     {
-        // Set
-        mtx_pos_.lock();
-        encoder_positions_[0] = encs[0];
-        encoder_positions_[1] = encs[1];
-        encoder_positions_[2] = encs[2];
-        encoder_positions_[3] = encs[3];
-        encoder_positions_[4] = encs[4];
-        encoder_positions_[5] = encs[5];
-        mtx_pos_.unlock();
+        const std::lock_guard<std::mutex> lock(mtx_pos_);
+        encoder_positions_ = encs;
         return true;
     }
     
@@ -247,9 +231,8 @@ public:
     bool set_position(float enc_pos, int idx)
     {
         // Set
-        mtx_pos_.lock();
+        const std::lock_guard<std::mutex> lock(mtx_pos_);
         encoder_positions_[idx] = enc_pos;
-        mtx_pos_.unlock();
         return true;
     }
 
@@ -262,14 +245,8 @@ public:
     bool set_velocity(std::array<float, 6> encs)
     {
         // Set
-        mtx_vel_.lock();
-        encoder_velocities_[0] = encs[0];
-        encoder_velocities_[1] = encs[1];
-        encoder_velocities_[2] = encs[2];
-        encoder_velocities_[3] = encs[3];
-        encoder_velocities_[4] = encs[4];
-        encoder_velocities_[5] = encs[5];
-        mtx_vel_.unlock();
+        const std::lock_guard<std::mutex> lock(mtx_vel_);
+        encoder_velocities_ = encs;
         return true;
     }
     
@@ -282,9 +259,8 @@ public:
     bool set_velocity(float enc_vel, int idx)
     {
         // Set
-        mtx_vel_.lock();
+        const std::lock_guard<std::mutex> lock(mtx_vel_);
         encoder_velocities_[idx] = enc_vel;
-        mtx_vel_.unlock();
         return true;
     }
     
@@ -429,7 +405,7 @@ private:
             }
 
             // Write at 100Hz [10ms]
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(encoder_broadcast_ms_);
         }
 
         //printf("CAN write ended");
@@ -481,36 +457,6 @@ private:
     /**
      * @brief Handles the set input pos
      * 
-     */
-    void velocity_updater_task()
-    {
-        std::cout << "Velocity update starting\r\n"; 
-        while (true)
-        {
-            if(!is_velocity_updating_.load())
-                break;
-
-            std::array<float, 6> current_pos = get_position();
-            std::array<float, 6> vel;
-            for (size_t i = 0; i < current_pos.size(); i++)
-            {
-                // Updating at 100Hz
-                // 10ms
-                // 10/1000 s
-                vel[0] = (current_pos[i] - prev_encoder_pos_[i]) * 100.0f;
-            }
-            
-            set_velocity(vel);
-            prev_encoder_pos_ = current_pos;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        
-        std::cout << "Velocity update ended\r\n"; 
-    }
-
-    /**
-     * @brief Handles the set input pos
-     * 
      * @param frame 
      */
     void set_input_pos_callback(const struct can_frame& frame)
@@ -528,12 +474,22 @@ private:
         // [] [] [] []   --   [] [] [] []
         //   4 bytes     --     4 bytes
         // encoder pos   --   encoder vel
-        float pos_buff;
-        std::memcpy(&pos_buff, &frame.data[0], 4);
+        float enc_pos;
+        std::memcpy(&enc_pos, &frame.data[0], 4);
 
         // Thread safety
         // Position, Velocity
-        set_position(pos_buff, joint_idx);
+        set_position(enc_pos, joint_idx);
+
+        // Set velocity
+        auto curr_time = std::chrono::steady_clock::now();
+        std::chrono::duration<float> fsecs = curr_time - prev_time_;
+        float enc_vel = (enc_pos - prev_encoder_pos_[joint_idx]) / fsecs.count();
+        set_velocity(enc_vel, joint_idx);
+
+        // Set
+        prev_time_ = curr_time;
+        prev_encoder_pos_[joint_idx] = enc_pos;
     }
 
     /**
@@ -556,6 +512,7 @@ private:
     std::array<float, 6> encoder_positions_;
     std::array<float, 6> encoder_velocities_;
     std::array<float, 6> prev_encoder_pos_;
+    std::chrono::steady_clock::time_point prev_time_;
 
     /**
      * @brief Socket handles for CAN communication
@@ -573,11 +530,10 @@ private:
     std::thread velocity_updater_thread_;
     std::atomic<bool> is_can_reading_;
     std::atomic<bool> is_can_writing_;
-    std::atomic<bool> is_velocity_updating_;
     std::mutex mtx_pos_;
     std::mutex mtx_vel_;
     bool is_main_running_;
-
+    std::chrono::milliseconds encoder_broadcast_ms_;
 };
 
 #endif // ODRIVE_CAN_SIM__ODRIVE_CAN_SIM_HPP_
