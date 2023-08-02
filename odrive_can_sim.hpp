@@ -46,6 +46,12 @@ public:
 
         // Threads
         encoder_broadcast_ms_ = std::chrono::milliseconds(10);
+        encoder_velocity_update_ms_ = std::chrono::milliseconds(10);
+
+        // Thread synchronization flags
+        run_reading_ = false;
+        run_writing_ = false;
+        run_velocity_update_ = false;
     }
     
     /**
@@ -68,6 +74,12 @@ public:
 
         // Threads
         encoder_broadcast_ms_ = std::chrono::milliseconds(encoder_broadcast_ms);
+        encoder_velocity_update_ms_ = std::chrono::milliseconds(10);
+
+        // Thread synchronization flags
+        run_reading_ = false;
+        run_writing_ = false;
+        run_velocity_update_ = false;
     }
 
     /**
@@ -159,11 +171,18 @@ public:
         printf("Odrive read/write threads starting\r\n");    
         is_can_reading_.store(true);
         is_can_writing_.store(true);
+        is_encoder_velocity_updater_running_ = true;
         can_read_thread_ = std::thread{&OdriveCanSim::can_read_task, this};
         can_write_thread_ = std::thread{&OdriveCanSim::can_write_task, this};
-          
+        encoder_velocity_updater_thread_ = std::thread{&OdriveCanSim::encoder_velocity_updater, this};
+
         printf("Odrive CAN connected\r\n");  
+        // Thread synchronization flags
         is_main_running_ = true;
+        run_reading_ = true;
+        run_writing_ = true;
+        run_velocity_update_ = true;
+
         return true;
     }
 
@@ -177,10 +196,11 @@ public:
         // Disable CAN reading and stop the threads
         is_can_reading_.store(false);
         is_can_writing_.store(false);
+        is_encoder_velocity_updater_running_ = false;
 
         // Stop spinning
         is_main_running_ = false;
-
+        
         // Close sockets
         int ret_r = close(socket_read_);
         int ret_w = close(socket_write_);
@@ -215,39 +235,35 @@ public:
      * @param pos 
      * @return true if successful, false otherwise
      */
-    bool set_position(std::array<float, 6> encs)
+    void set_position(const std::array<float, 6>& encs)
     {
         const std::lock_guard<std::mutex> lock(mtx_pos_);
         encoder_positions_ = encs;
-        return true;
     }
     
     /**
      * @brief Set the encoder positions
      * 
-     * @param pos 
-     * @return true if successful, false otherwise
+     * @param enc_pos 
+     * @param idx 
      */
-    bool set_position(float enc_pos, int idx)
+    void set_position(float enc_pos, int idx)
     {
         // Set
         const std::lock_guard<std::mutex> lock(mtx_pos_);
         encoder_positions_[idx] = enc_pos;
-        return true;
     }
 
     /**
-     * @brief Set the encoder positions
+     * @brief Set the encoder velocity
      * 
-     * @param pos 
-     * @return true if successful, false otherwise
+     * @param encs 
      */
-    bool set_velocity(std::array<float, 6> encs)
+    void set_velocity(const std::array<float, 6>& encs)
     {
         // Set
         const std::lock_guard<std::mutex> lock(mtx_vel_);
         encoder_velocities_ = encs;
-        return true;
     }
     
     /**
@@ -256,34 +272,13 @@ public:
      * @param pos 
      * @return true if successful, false otherwise
      */
-    bool set_velocity(float enc_vel, int idx)
+    void set_velocity(float enc_vel, int idx)
     {
         // Set
         const std::lock_guard<std::mutex> lock(mtx_vel_);
         encoder_velocities_[idx] = enc_vel;
-        return true;
     }
     
-    /**
-     * @brief Get errors in the odrive controllers
-     * 
-     * @return int 
-     */
-    int get_errors()
-    {
-        return 0x0000;
-    }
-
-    /**
-     * @brief Clear errors in the odrive controllers
-     * 
-     * @return true if successful, false otherwise
-     */
-    bool clear_errors()
-    {
-        return true;
-    }
-
     /**
      * @brief Inifite looping
     */
@@ -301,6 +296,7 @@ public:
         printf("Odrive waiting for threads to join\r\n");
         can_read_thread_.join();
         can_write_thread_.join();
+        encoder_velocity_updater_thread_.join();
         printf("Odrive threads joined\r\n");
         printf("Odrive CAN spinning ended\r\n");
     }
@@ -338,6 +334,12 @@ private:
         struct can_frame frame;
         memset(&frame, 0, sizeof(struct can_frame));
 
+        // Wait flag
+        while(!run_reading_)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+            
         std::cout << "CAN read starting\r\n"; 
         while(true)
         {
@@ -370,6 +372,12 @@ private:
          // Set
         struct can_frame frame;
         memset(&frame, 0, sizeof(struct can_frame));
+
+        // Wait flag
+        while(!run_writing_)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
 
         //printf("CAN write starting");
         std::cout << "CAN write starting\r\n"; 
@@ -480,16 +488,6 @@ private:
         // Thread safety
         // Position, Velocity
         set_position(enc_pos, joint_idx);
-
-        // Set velocity
-        auto curr_time = std::chrono::steady_clock::now();
-        std::chrono::duration<float> fsecs = curr_time - prev_time_;
-        float enc_vel = (enc_pos - prev_encoder_pos_[joint_idx]) / fsecs.count();
-        set_velocity(enc_vel, joint_idx);
-
-        // Set
-        prev_time_ = curr_time;
-        prev_encoder_pos_[joint_idx] = enc_pos;
     }
 
     /**
@@ -500,6 +498,54 @@ private:
     void stop_callback(const struct can_frame& frame)
     {
         this->disconnect();
+    }
+
+    /**
+     * @brief 
+     * 
+     */
+    void encoder_velocity_updater()
+    {
+        // Initialize   
+        prev_time_ = std::chrono::steady_clock::now();
+        prev_encoder_pos_ = get_position();
+        auto curr_vel = get_velocity();
+        float epsilon = 0.001f;
+
+        // Wait flag
+        while(!run_velocity_update_)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        printf("Velocity updater starting\r\n");
+        
+        while(true)
+        {
+            // Guard
+            if(!is_encoder_velocity_updater_running_)
+                break;
+
+            // Get
+            auto curr_pos = get_position();
+            auto curr_time = std::chrono::steady_clock::now();
+            std::chrono::duration<float> dt = curr_time - prev_time_;
+            if(std::abs(dt.count()) < epsilon)
+                continue;
+
+            // Set
+            for (size_t i = 0; i < curr_pos.size(); i++)
+            {
+                curr_vel[i] = (curr_pos[i] - prev_encoder_pos_[i]) / dt.count();
+            }
+            set_velocity(curr_vel);
+
+            prev_time_ = curr_time;
+            prev_encoder_pos_ = curr_pos;
+            std::this_thread::sleep_for(encoder_velocity_update_ms_);
+        }
+
+        printf("Velocity updater end\r\n");
     }
 
 private:
@@ -527,13 +573,28 @@ private:
      */
     std::thread can_read_thread_;
     std::thread can_write_thread_;
-    std::thread velocity_updater_thread_;
+    std::thread encoder_velocity_updater_thread_;
     std::atomic<bool> is_can_reading_;
     std::atomic<bool> is_can_writing_;
+    std::atomic<bool> is_main_running_;
+    std::atomic<bool> is_encoder_velocity_updater_running_;
     std::mutex mtx_pos_;
     std::mutex mtx_vel_;
-    bool is_main_running_;
+
+    /**
+     * @brief Thread sync flags, this should be implemented using semaphores
+     * in the future
+     */
+    std::atomic<bool> run_reading_;
+    std::atomic<bool> run_writing_;
+    std::atomic<bool> run_velocity_update_;
+
+    /**
+     * @brief Timers
+     * 
+     */
     std::chrono::milliseconds encoder_broadcast_ms_;
+    std::chrono::milliseconds encoder_velocity_update_ms_;
 };
 
 #endif // ODRIVE_CAN_SIM__ODRIVE_CAN_SIM_HPP_
