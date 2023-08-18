@@ -47,11 +47,6 @@ public:
         // Threads
         encoder_broadcast_ms_ = std::chrono::milliseconds(10);
         encoder_velocity_update_ms_ = std::chrono::milliseconds(10);
-
-        // Thread synchronization flags
-        run_reading_ = false;
-        run_writing_ = false;
-        run_velocity_update_ = false;
     }
     
     /**
@@ -75,11 +70,6 @@ public:
         // Threads
         encoder_broadcast_ms_ = std::chrono::milliseconds(encoder_broadcast_ms);
         encoder_velocity_update_ms_ = std::chrono::milliseconds(10);
-
-        // Thread synchronization flags
-        run_reading_ = false;
-        run_writing_ = false;
-        run_velocity_update_ = false;
     }
 
     /**
@@ -179,10 +169,6 @@ public:
         printf("Odrive CAN connected\r\n");  
         // Thread synchronization flags
         is_main_running_ = true;
-        run_reading_ = true;
-        run_writing_ = true;
-        run_velocity_update_ = true;
-
         return true;
     }
 
@@ -286,6 +272,14 @@ public:
     {
         printf("Odrive CAN spinning\r\n");
         printf("Send a 0xFFF CAN id to stop\r\n");
+
+        // Start Velocity updater
+        main_velocity_update_semaphore_.release();
+
+        // Start Read/Write
+        main_can_read_semaphore_.release();
+        main_can_write_semaphore_.release();
+
         while(true)
         {
             if(!is_main_running_)
@@ -334,11 +328,8 @@ private:
         struct can_frame frame;
         memset(&frame, 0, sizeof(struct can_frame));
 
-        // Wait flag
-        while(!run_reading_)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
+        // Wait for the main thread
+        main_can_read_semaphore_.acquire();
             
         std::cout << "CAN read starting\r\n"; 
         while(true)
@@ -373,11 +364,8 @@ private:
         struct can_frame frame;
         memset(&frame, 0, sizeof(struct can_frame));
 
-        // Wait flag
-        while(!run_writing_)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
+        // Wait for the main thread
+        main_can_write_semaphore_.acquire();
 
         //printf("CAN write starting");
         std::cout << "CAN write starting\r\n"; 
@@ -506,19 +494,16 @@ private:
      */
     void encoder_velocity_updater()
     {
+        // Wait for the main thread
+        main_velocity_update_semaphore_.acquire();
+        
+        printf("Velocity updater starting\r\n");
+
         // Initialize   
         prev_time_ = std::chrono::steady_clock::now();
         prev_encoder_pos_ = get_position();
         auto curr_vel = get_velocity();
         float epsilon = 0.001f;
-
-        // Wait flag
-        while(!run_velocity_update_)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-
-        printf("Velocity updater starting\r\n");
         
         while(true)
         {
@@ -582,12 +567,11 @@ private:
     std::mutex mtx_vel_;
 
     /**
-     * @brief Thread sync flags, this should be implemented using semaphores
-     * in the future
+     * @brief Thread sync flags
      */
-    std::atomic<bool> run_reading_;
-    std::atomic<bool> run_writing_;
-    std::atomic<bool> run_velocity_update_;
+    std::binary_semaphore main_can_read_semaphore_{0};
+    std::binary_semaphore main_can_write_semaphore_{0};
+    std::binary_semaphore main_velocity_update_semaphore_{0};
 
     /**
      * @brief Timers
